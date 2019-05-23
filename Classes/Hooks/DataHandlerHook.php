@@ -2,9 +2,13 @@
 
 namespace OliverKlee\Seminars\Hooks;
 
+use Recurr\Rule;
+use Recurr\Transformer\ArrayTransformer;
+use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Utility\MathUtility;
+use TYPO3\CMS\Core\Utility\VersionNumberUtility;
 
 /**
  * This class holds functions used to validate submitted forms in the back end.
@@ -18,6 +22,16 @@ use TYPO3\CMS\Core\Utility\MathUtility;
 class DataHandlerHook
 {
     /**
+     * @var string
+     */
+    const DATE_RENDER_FORMAT = 'Y-m-d\\TH:i:s\\Z';
+
+    /**
+     * @var string
+     */
+    const DATE_PARSE_FORMAT = 'Y-m-d?H:i:s?';
+
+    /**
      * @var string[]
      */
     private $registeredTables = ['tx_seminars_seminars', 'tx_seminars_timeslots'];
@@ -26,6 +40,37 @@ class DataHandlerHook
      * @var array[]
      */
     private $tceMainFieldArrays = [];
+
+    /**
+     * Creates the time slots requested by the time slot wizard (if any are requested).
+     *
+     * @param DataHandler $dataHandler
+     *
+     * @return void
+     */
+    public function processDatamap_beforeStart(DataHandler $dataHandler)
+    {
+        $allData = &$dataHandler->datamap;
+        if (!isset($allData['tx_seminars_seminars'])) {
+            return;
+        }
+
+        if (!isset($allData['tx_seminars_timeslots'])) {
+            $allData['tx_seminars_timeslots'] = [];
+        }
+        $allTimeSlots = &$allData['tx_seminars_timeslots'];
+
+        $events = &$allData['tx_seminars_seminars'];
+        foreach ($events as $eventUid => &$event) {
+            $wizardConfiguration = (array)$event['time_slot_wizard'];
+            unset($event['time_slot_wizard']);
+            if (!$this->isValidTimeSlotConfiguration($wizardConfiguration)) {
+                continue;
+            }
+
+            $this->createTimeSlots($event, $eventUid, $wizardConfiguration, $allTimeSlots);
+        }
+    }
 
     /**
      * Handles data after everything had been written to the database.
@@ -174,5 +219,117 @@ class DataHandlerHook
         if ($event->isOk()) {
             $event->saveToDatabase($event->getUpdateArray($fieldArray));
         }
+    }
+
+    /**
+     * @param array $configuration
+     *
+     * @return bool
+     */
+    private function isValidTimeSlotConfiguration(array $configuration)
+    {
+        $requiredFields = ['first_start', 'first_end', 'all', 'frequency', 'until'];
+        foreach ($requiredFields as $field) {
+            if (empty($configuration[$field])) {
+                return false;
+            }
+        }
+
+        $all = (int)$configuration['all'];
+        $valid = $all > 0;
+
+        $validFrequencies = ['daily', 'weekly', 'monthly', 'yearly'];
+        $frequency = $configuration['frequency'];
+        $valid = $valid && \in_array($frequency, $validFrequencies, true);
+
+        if (VersionNumberUtility::convertVersionNumberToInteger(TYPO3_version) >= 8007000) {
+            $firstStart = \DateTime::createFromFormat(
+                self::DATE_RENDER_FORMAT,
+                $configuration['first_start']
+            )->getTimestamp();
+            $firstEnd = \DateTime::createFromFormat(
+                self::DATE_RENDER_FORMAT,
+                $configuration['first_end']
+            )->getTimestamp();
+            $until = \DateTime::createFromFormat(
+                self::DATE_RENDER_FORMAT,
+                $configuration['until']
+            )->getTimestamp();
+        } else {
+            $firstStart = (int)$configuration['first_start'];
+            $firstEnd = (int)$configuration['first_end'];
+            $until = (int)$configuration['until'];
+        }
+        $valid = $valid && $firstStart > 0 && $firstEnd > $firstStart && $until > $firstStart;
+
+        return $valid;
+    }
+
+    /**
+     * @param array $event
+     * @param string|int $eventUid
+     * @param array $configuration
+     * @param array $allTimeSlots
+     */
+    private function createTimeSlots(array &$event, $eventUid, array $configuration, array &$allTimeSlots)
+    {
+        if (!\class_exists(Rule::class)) {
+            require_once __DIR__ . '/../../Resources/Private/Php/vendor/autoload.php';
+        }
+
+        if (isset($event['pid'])) {
+            $eventPid = (int)$event['pid'];
+        } else {
+            $record = BackendUtility::getRecord('tx_seminars_seminars', $eventUid, 'pid');
+            $eventPid = (int)$record['pid'];
+        }
+
+        $timeSlotUids = GeneralUtility::trimExplode(',', $event['timeslots']);
+
+        $all = (int)$configuration['all'];
+        $frequency = $configuration['frequency'];
+        if (VersionNumberUtility::convertVersionNumberToInteger(TYPO3_version) >= 8007000) {
+            $firstStart = \DateTime::createFromFormat(self::DATE_RENDER_FORMAT, $configuration['first_start']);
+            $firstEnd = \DateTime::createFromFormat(self::DATE_RENDER_FORMAT, $configuration['first_end']);
+            $until = \DateTime::createFromFormat(self::DATE_RENDER_FORMAT, $configuration['until']);
+        } else {
+            $firstStart = new \DateTime();
+            $firstStart->setTimestamp((int)$configuration['first_start']);
+            $firstEnd = new \DateTime();
+            $firstEnd->setTimestamp((int)$configuration['first_end']);
+            $until = new \DateTime();
+            $until->setTimestamp((int)$configuration['until']);
+        }
+
+        $frequencyCommand = \strtoupper($frequency);
+        $rule = new Rule();
+        $rule->setStartDate($firstStart)
+            ->setEndDate($firstEnd)
+            ->setFreq($frequencyCommand)
+            ->setInterval($all)
+            ->setUntil($until);
+
+        $transformer = new ArrayTransformer();
+        $recurrences = $transformer->transform($rule);
+        foreach ($recurrences as $recurrence) {
+            $temporaryUid = \uniqid('NEW', true);
+            $timeSlotUids[] = $temporaryUid;
+            $start = $recurrence->getStart();
+            $end = $recurrence->getEnd();
+            if (VersionNumberUtility::convertVersionNumberToInteger(TYPO3_version) >= 8007000) {
+                $formattedStart = $start->format(self::DATE_RENDER_FORMAT);
+                $formattedEnd = $end->format(self::DATE_RENDER_FORMAT);
+            } else {
+                $formattedStart = (string)$start->getTimestamp();
+                $formattedEnd = (string)$end->getTimestamp();
+            }
+            $allTimeSlots[$temporaryUid] = [
+                'pid' => $eventPid,
+                'begin_date' => $formattedStart,
+                'end_date' => $formattedEnd,
+            ];
+        }
+
+        $event['timeslots'] = \implode(',', $timeSlotUids);
     }
 }
